@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+import importlib
+import logging
+import os
+import shlex
+import typing as t
+from functools import lru_cache
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from jinja2.loaders import FileSystemLoader
+from jinja2.sandbox import SandboxedEnvironment as Environment
+
+from ..configuration.containers import BentoMLContainer
+from ..utils.filesystem import resolve_user_filepath
+from .frontend.dockerfile import DistroSpec
+from .frontend.dockerfile import get_cuda_base_image
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    P = t.ParamSpec("P")
+
+    from ..bento.build_config import CondaOptions
+    from ..bento.build_config import DockerOptions
+
+    TemplateFunc = t.Callable[[DockerOptions], dict[str, t.Any]]
+    F = t.Callable[P, t.Any]
+
+BENTO_UID_GID = 1034
+BENTO_USER = "bentoml"
+BENTO_HOME = f"/home/{BENTO_USER}/"
+BENTO_PATH = f"{BENTO_HOME}bento"
+# 1.2.1 is the current docker frontend that both buildkitd and kaniko supports.
+BENTO_BUILDKIT_FRONTEND = "docker/dockerfile:1.2.1"
+DEFAULT_BENTO_ENVS = {
+    "uid_gid": BENTO_UID_GID,
+    "user": BENTO_USER,
+    "home": BENTO_HOME,
+    "path": BENTO_PATH,
+    "add_header": True,
+    "buildkit_frontend": BENTO_BUILDKIT_FRONTEND,
+    "enable_buildkit": True,
+}
+
+
+def expands_bento_path(*path: str, bento_path: str = BENTO_PATH) -> str:
+    """
+    Expand a given paths with respect to :code:`BENTO_PATH`.
+    Note on using "/": the returned path is meant to be used in the generated Dockerfile.
+    """
+    return "/".join([bento_path, *path])
+
+
+def normalize_line(s: str) -> str:
+    """
+    Normalize a line by stripping leading and trailing whitespaces and replacing multiple spaces with a single space.
+    """
+    return " ".join(s.strip().split())
+
+
+J2_FUNCTION: dict[str, F[t.Any]] = {"expands_bento_path": expands_bento_path}
+
+
+def to_bento_field(s: str):
+    return f"bento__{s}"
+
+
+def to_options_field(s: str):
+    return f"__options__{s}"
+
+
+def get_templates_variables(
+    docker: DockerOptions,
+    conda: CondaOptions,
+    bento_fs: Path,
+    *,
+    python_packages: dict[str, str] | None = None,
+    _is_cuda: bool = False,
+    **bento_env: str | bool,
+) -> dict[str, t.Any]:
+    """
+    Returns a dictionary of variables to be used in BentoML base templates.
+    """
+    conda_python_version = conda.get_python_version(bento_fs)
+    if conda_python_version is None:
+        conda_python_version = docker.python_version
+
+    if docker.base_image is not None:
+        base_image = docker.base_image
+        logger.info(
+            "BentoML will not install Python to custom base images; ensure the base image '%s' has Python installed.",
+            base_image,
+        )
+    else:
+        spec = DistroSpec.from_options(docker, conda)
+        python_version = docker.python_version
+        assert docker.distro is not None and python_version is not None
+        if docker.distro in ("ubi8",):
+            # ubi8 base images uses "py38" instead of "py3.8" in its image tag
+            python_version = python_version.replace(".", "")
+        base_image = spec.image.format(spec_version=python_version)
+        if docker.cuda_version is not None:
+            base_image = get_cuda_base_image(docker.distro, docker.cuda_version)
+
+    # bento__env
+    default_env = {**DEFAULT_BENTO_ENVS, **bento_env}
+
+    return {
+        **{to_options_field(k): v for k, v in docker.to_dict().items()},
+        **{to_bento_field(k): v for k, v in default_env.items()},
+        "__prometheus_port__": BentoMLContainer.grpc.metrics.port.get(),
+        "__base_image__": base_image,
+        "__conda_python_version__": conda_python_version,
+        "__is_cuda__": _is_cuda,
+    }
+
+
+@lru_cache(maxsize=1)
+def build_environment() -> Environment:
+    templates_path = importlib.import_module(
+        "bentoml._internal.container.frontend.dockerfile.templates"
+    ).__path__
+    environment = Environment(
+        extensions=["jinja2.ext.loopcontrols"],
+        trim_blocks=True,
+        lstrip_blocks=True,
+        loader=FileSystemLoader(templates_path, followlinks=True),
+    )
+    environment.filters["bash_quote"] = shlex.quote
+    environment.filters["normalize_line"] = normalize_line
+    environment.globals["expands_bento_path"] = expands_bento_path
+    return environment
+
+
+def generate_containerfile(
+    docker: DockerOptions,
+    build_ctx: str,
+    *,
+    conda: CondaOptions,
+    bento_fs: Path,
+    frontend: str = "dockerfile",
+    **override_bento_env: t.Any,
+) -> str:
+    """
+    Generate a Dockerfile that containerize a Bento.
+
+    .. note::
+
+        You should use ``construct_containerfile`` instead of this function.
+
+    Returns:
+        str: The rendered Dockerfile string.
+
+    .. dropdown:: Implementation Notes
+
+        The coresponding Dockerfile template will be determined automatically based on given :class:`DockerOptions`.
+        The templates are located `here <https://github.com/bentoml/BentoML/tree/main/src/bentoml/_internal/bento/docker/templates>`_
+
+        As one can see, the Dockerfile templates are organized with the format :code:`<release_type>_<distro>.j2` with:
+
+        +---------------+------------------------------------------+
+        | Release type  | Description                              |
+        +===============+==========================================+
+        | base          | A base setup for all supported distros.  |
+        +---------------+------------------------------------------+
+        | cuda          | CUDA-supported templates.                |
+        +---------------+------------------------------------------+
+        | miniconda     | Conda-supported templates.               |
+        +---------------+------------------------------------------+
+        | python        | Python releases.                         |
+        +---------------+------------------------------------------+
+
+        All templates will have the following blocks: "SETUP_BENTO_BASE_IMAGE", "SETUP_BENTO_USER", "SETUP_BENTO_ENVARS", "SETUP_BENTO_COMPONENTS", "SETUP_BENTO_ENTRYPOINT",
+
+        Overriding templates variables: bento__uid_gid, bento__user, bento__home, bento__path, bento__enable_buildkit
+    """
+    templates_path = importlib.import_module(
+        "bentoml._internal.container.frontend.dockerfile.templates"
+    ).__path__
+    ENVIRONMENT = build_environment()
+
+    if docker.cuda_version is not None:
+        release_type = "cuda"
+    elif not conda.is_empty():
+        release_type = "miniconda"
+    else:
+        release_type = "python"
+    base = f"{release_type}_{docker.distro}.j2"
+    if docker.base_image is not None:
+        # If base_image is specified, then use the base template instead.
+        base = "base.j2"
+
+    template = ENVIRONMENT.get_template(base, globals=J2_FUNCTION)
+    logger.debug(
+        'Using base Dockerfile template: "%s" (path: "%s")',
+        base,
+        os.path.join(templates_path[0], base),
+    )
+
+    user_templates = docker.dockerfile_template
+    if user_templates is not None:
+        dir_path = os.path.dirname(resolve_user_filepath(user_templates, build_ctx))
+        user_templates = os.path.basename(user_templates)
+        templates_path.append(dir_path)
+        environment = ENVIRONMENT.overlay(
+            loader=FileSystemLoader(templates_path, followlinks=True)
+        )
+        template = environment.get_template(
+            user_templates,
+            globals={"bento_base_template": template, **J2_FUNCTION},
+        )
+
+    requirement_file = bento_fs.joinpath("env/python/requirements.lock.txt")
+    if not requirement_file.exists():
+        requirement_file = bento_fs.joinpath("env/python/requirements.txt")
+    if requirement_file.exists():
+        python_packages = resolve_package_versions(str(requirement_file))
+    else:
+        python_packages = {}
+
+    return template.render(
+        **get_templates_variables(
+            docker,
+            conda,
+            bento_fs,
+            python_packages=python_packages,
+            _is_cuda=release_type == "cuda",
+            **override_bento_env,
+        )
+    )
+
+
+def resolve_package_versions(requirement: str) -> dict[str, str]:
+    from pip_requirements_parser import RequirementsFile
+
+    requirements_txt = RequirementsFile.from_file(
+        requirement,
+        include_nested=True,
+    )
+    deps: dict[str, str] = {}
+    for req in requirements_txt.requirements:
+        if (
+            req.is_editable
+            or req.is_local_path
+            or req.is_url
+            or req.is_wheel
+            or not req.name
+            or not req.specifier
+        ):
+            continue
+        for sp in req.specifier:
+            if sp.operator == "==":
+                assert req.line is not None
+                deps[req.name] = req.line
+                break
+    return deps

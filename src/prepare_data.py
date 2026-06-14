@@ -9,7 +9,7 @@ df = pd.read_csv(DATA_PATH)
 df.columns = df.columns.str.strip()
 
 target = "Chance of Admit"
-X = df.drop(columns=[target])
+X = df.drop(columns=["Serial No.", target])
 y = df[target]
 
 X_train, X_test, y_train, y_test = train_test_split(

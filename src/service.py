@@ -5,7 +5,8 @@ from typing import Any
 
 import bentoml
 import jwt
-from fastapi import HTTPException, status
+from bentoml.exceptions import BentoMLException
+from http import HTTPStatus
 from pydantic import BaseModel, Field
 
 MODEL_REF = "admission_lr:latest"
@@ -51,38 +52,41 @@ def verify_token(token: str) -> dict[str, Any]:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired") from exc
+        raise BentoMLException("Token expired", error_code=HTTPStatus.UNAUTHORIZED) from exc
     except jwt.InvalidTokenError as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
+        raise BentoMLException("Invalid token", error_code=HTTPStatus.UNAUTHORIZED) from exc
 
 
 @bentoml.service(name="admission_prediction_service")
 class AdmissionPredictionService:
-    @bentoml.api
-    def login(self, body: LoginRequest) -> TokenResponse:
-        if body.username != "admin" or body.password != "admin123":
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-        token = create_access_token({"sub": body.username})
+    @bentoml.api(input_spec=LoginRequest)
+    def login(self, username: str, password: str) -> TokenResponse:
+        if username != "admin" or password != "admin123":
+            raise BentoMLException("Invalid credentials", error_code=HTTPStatus.UNAUTHORIZED)
+        token = create_access_token({"sub": username})
         return TokenResponse(access_token=token)
 
-    @bentoml.api
-    def predict(self, body: PredictRequest, authorization: str | None = None) -> PredictResponse:
+    @bentoml.api(input_spec=PredictRequest)
+    def predict(
+        self,
+        gre_score: float,
+        toefl_score: float,
+        university_rating: float,
+        sop: float,
+        lor: float,
+        cgpa: float,
+        research: float,
+        ctx: bentoml.Context,
+    ) -> PredictResponse:
+        authorization = ctx.request.headers.get("authorization")
         if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
+            raise BentoMLException("Missing token", error_code=HTTPStatus.UNAUTHORIZED)
         token = authorization.removeprefix("Bearer ").strip()
         verify_token(token)
 
-        features = [[
-            body.gre_score,
-            body.toefl_score,
-            body.university_rating,
-            body.sop,
-            body.lor,
-            body.cgpa,
-            body.research,
-        ]]
+        features = [[gre_score, toefl_score, university_rating, sop, lor, cgpa, research]]
         prediction = float(model.predict(features)[0])
         return PredictResponse(chance_of_admit=prediction)
 
 
-svc = AdmissionPredictionService()
+svc = AdmissionPredictionService
